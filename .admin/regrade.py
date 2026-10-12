@@ -98,31 +98,26 @@ def load_and_initialize_report(submissions_dir):
         print(f"[-] ERROR: '{submissions_dir}' folder not found when trying to load original marks.")
         return report_data
 
-    # Loop through student roll number folders (matching the structure expected in main)
-    for roll_dir in os.listdir(submissions_dir):
-        student_path = os.path.join(submissions_dir, roll_dir)
-        if not os.path.isdir(student_path):
+    for q_dir in os.listdir(submissions_dir):
+        q_path = os.path.join(submissions_dir, q_dir)
+        if not os.path.isdir(q_path):
             continue
-            
-        # Loop through question folders (e.g., Q1, Q2) inside the student's directory
-        for q_dir in os.listdir(student_path):
-            q_path = os.path.join(student_path, q_dir)
-            if not os.path.isdir(q_path):
-                print(str(q_path)+" path does not exist")
+
+        for roll_dir in os.listdir(q_path):
+            student_path = os.path.join(q_path, roll_dir)
+            if not os.path.isdir(student_path):
+                print(f"[-] Skipping {student_path}: not a directory")
                 continue
-                
-            marks_file = os.path.join(q_path, "marks.txt")
+
+            marks_file = os.path.join(student_path, "marks.txt")
             if os.path.exists(marks_file):
                 mark, _ = get_highest_mark(marks_file)
                 if mark >= 0:
-                    if roll_dir not in report_data:
-                        report_data[roll_dir] = {}
-                    
                     # Directly initialize the reporting structure with the original mark
-                    report_data[roll_dir][q_dir] = {
+                    report_data.setdefault(q_dir, {})[roll_dir] = {
                         'Original_Mark': mark,
-                        'New_Mark': None, 
-                        'Delta': None     
+                        'New_Mark': None,
+                        'Delta': None,
                     }
     return report_data
 
@@ -244,17 +239,17 @@ def print_run_result(question: str, testcase_dir: Path, result: subprocess.Compl
     else:
         print("[LOG] No output captured.")
 
-    failure_tokens = (
-        "WRONG_ANSWER",
-        "TIMEOUT",
-        "RUNTIME_ERROR",
+    # Only whole-run failures are fatal. Per-test verdicts (WRONG_ANSWER,
+    # TIMEOUT, RUNTIME_ERROR) must flow through to extract_test_counts()
+    # so students get passed/total partial credit.
+    fatal_tokens = (
         "COMPILATION_ERROR",
         "No input directory found",
         "Config file not found",
         "Missing required arguments",
     )
 
-    return any(token in output for token in failure_tokens)
+    return any(token in output for token in fatal_tokens)
 
 def extract_test_counts(stdout_str: str) -> tuple[int, int]:
     """
@@ -287,6 +282,7 @@ def extract_test_counts(stdout_str: str) -> tuple[int, int]:
     return passed, total
 
 def main() -> int:
+    print("RUNNING FILE:", Path(__file__).resolve())
     print("IndiGrader Batch Re-evaluator")
     print("=" * 50)
 
@@ -318,16 +314,21 @@ def main() -> int:
     print(f"[*] Found lab: {lab_name}")
     print(f"[*] Questions: {', '.join(question_names)}")
 
-    orginal_marks_dir = config_path.parent / "submissions"
+    original_marks_dir = config_path.parent / "submissions"
     
     # Load marks and initialize the report dictionary
-    report_data = load_and_initialize_report(orginal_marks_dir)
-    
+    report_data = load_and_initialize_report(original_marks_dir)
+    print("TOP-LEVEL KEYS:", list(report_data.keys())[:5])
+    n_students = len({s for q in report_data.values() for s in q})
     if report_data:
-        print(f"[*] Initialized comparison report data for {len(report_data)} students.")
+        print(f"[*] Initialized comparison report data for {n_students} students.")
 
     submissions_dir=config_path.parent /"highest_submissions_by_stu"
-    for student_dir in submissions_dir.iterdir():
+    if not submissions_dir.is_dir():
+        print(f"[-] '{submissions_dir}' folder not found. Run sort_stu.py first")
+        return 1
+
+    for student_dir in sorted(submissions_dir.iterdir()):
         if not student_dir.is_dir():
             continue
         
@@ -335,10 +336,12 @@ def main() -> int:
         for question in question_names:
             submission_path = find_submission_path(student_dir, question, config_data)
             entry = report_data.setdefault(question, {}).setdefault(student_id, {'Original_Mark': 0.0})
+            original_mark = float(entry.get('Original_Mark', 0.0))   # read once, up front
+
             if not submission_path:
                 print(f"[-] Missing submission for {student_id} - {question}")
                 entry['New_Mark'] = 0.0
-                entry['Delta'] = 0.0 - entry['Original_Mark']
+                entry['Delta'] = 0.0 - original_mark                 # uses the variable
                 continue
 
             #handle makefile            
@@ -353,14 +356,12 @@ def main() -> int:
             else:
                 # If it's a standard file (.c, .py), just use the original path
                 active_submission_path = submission_path
-
-            print(active_submission_path)
             print(f"[*] Evaluating {student_id} for {question} at {active_submission_path}")
 
             qcfg = config_data.get(question, {})
             full_marks = float(qcfg.get("full_marks", 100.0))
-            total_passed=0;
-            total_cases=0;
+            total_passed=0
+            total_cases=0
             
             for testcase_dir in testcase_dirs:
                 try:
@@ -384,9 +385,8 @@ def main() -> int:
                 total_new_mark = round((total_passed / total_cases) * full_marks, 2)
             else:
                 total_new_mark = 0.0
-            original_mark = float(entry.get('Original_Mark', 0.0))
             entry['New_Mark'] = total_new_mark
-            entry['Delta'] = total_new_mark - original_mark
+            entry['Delta'] = round(total_new_mark - original_mark, 2) 
             
             print(f"    -> Original: {original_mark} | New: {total_new_mark} | Delta: {entry['Delta']}")
 
@@ -403,23 +403,24 @@ def main() -> int:
         writer = csv.writer(csv_file)
         writer.writerow(["Student_ID", "Question", "Original_Mark", "New_Mark", "Delta"])
 
-        # Sort questions alphabetically (e.g., Q1, Q2)
-        for question in sorted(report_data.keys()):
-            students = report_data[question]
-            
-            # Sort student IDs alphabetically (e.g., CS28B001, CS28B002)
-            for student_id in sorted(students.keys()):
-                data = students[student_id]
-                
-                # Safely round Delta only if it is not None
-                delta = data.get('Delta')
+        # Collect every student ID and question that appears in the report
+        all_students = sorted({s for q in report_data.values() for s in q})
+        all_questions = sorted(report_data.keys())
+
+        for student_id in all_students:
+            for question in all_questions:
+                data = report_data[question].get(student_id)
+                if data is None:
+                    continue  # this student has no entry for this question
                 writer.writerow([
                     student_id,
                     question,
                     data.get('Original_Mark'),
                     data.get('New_Mark'),
-                    delta
+                    data.get('Delta'),
                 ])
+
+                
     print("\n[RESULT] Batch re-evaluation complete. Check before_vs_after.csv for results.")
     return 0
 
