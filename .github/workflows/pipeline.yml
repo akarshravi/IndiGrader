@@ -3,10 +3,10 @@ name: Test Pipeline
 on:
   pull_request:
     branches:
-      - main
+      - github-actions-pipeline
   push:
     branches:
-      - main
+      - github-actions-pipeline
 
 jobs:
   test:
@@ -35,7 +35,7 @@ jobs:
       - name: Run Builder Script
         run: |
           source ~/.venv/bin/activate
-          # Start 5 min in the past so the lab is already open when tests run
+          rm -rf Labs/packageIG_L1 Labs/packageIG_L1.zip
           START_DATE=$(date -d '5 minutes ago' +%Y-%m-%d)
           START_TIME=$(date -d '5 minutes ago' +%H%M)
 
@@ -49,21 +49,58 @@ jobs:
           ${START_TIME}
           1440
 
-          /.github/workflows/demo_data/students.txt
-          /.github/workflows/demo_data/pwd_students.txt
-          /.github/workflows/demo_data/APL1.pdf
+          .github/workflows/demo_data/students.txt
+          .github/workflows/demo_data/pwd_students.txt
+          .github/workflows/demo_data/APL1.pdf
+
+          5
 
 
 
+          n
+
+          .github/workflows/demo_data/testcases/Q1/public
+          .github/workflows/demo_data/testcases/Q1/private
+
+          .github/workflows/demo_data/Reference_solutions/Q1.c
 
 
 
+          n
 
-          /.github/workflows/demo_data/testcases
-          /.github/workflows/demo_data/testcases
-          /.github/workflows/demo_data/static
+          .github/workflows/demo_data/testcases/Q2/public
+          .github/workflows/demo_data/testcases/Q2/private
+
+          .github/workflows/demo_data/Reference_solutions/Q2.c
 
 
+
+          n
+
+          .github/workflows/demo_data/testcases/Q3/public
+          .github/workflows/demo_data/testcases/Q3/private
+
+          .github/workflows/demo_data/Reference_solutions/Q3.c
+
+
+
+          y
+
+
+          .github/workflows/demo_data/testcases/Q4/public
+          .github/workflows/demo_data/testcases/Q4/private
+
+          .github/workflows/demo_data/Reference_solutions/Q4
+
+
+
+          y
+
+
+          .github/workflows/demo_data/testcases/Q5/public
+          .github/workflows/demo_data/testcases/Q5/private
+          .github/workflows/demo_data/testcases/Q5/public/static
+          .github/workflows/demo_data/Reference_solutions/Q5
           EOF
 
       - name: List Created Files
