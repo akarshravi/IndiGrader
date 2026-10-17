@@ -1,0 +1,17 @@
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c99
+TARGET = Q1
+
+all: $(TARGET)
+
+$(TARGET): main.o matrix.o
+	$(CC) $(CFLAGS) -o $(TARGET) main.o matrix.o
+
+main.o: main.c matrix.h
+	$(CC) $(CFLAGS) -c main.c
+
+matrix.o: matrix.c matrix.h
+	$(CC) $(CFLAGS) -c matrix.c
+
+clean:
+	rm -f *.o $(TARGET)
