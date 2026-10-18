@@ -24,7 +24,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server firejail jq tree
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y redis-server firejail jq tree time
 
       - name: Setup Virtual Environment & Install Python Libraries
         run: |
@@ -110,3 +110,255 @@ jobs:
           
           echo "Listing generated Lab packages:"
           tree Labs/
+
+      - name: "Smoke 1/12 - Create shared helpers"
+        working-directory: Labs/packageIG_L1
+        run: |
+          cat > "$RUNNER_TEMP/helpers.sh" <<'HELPERS'
+          BASE=http://127.0.0.1:8000
+          DEMO="$GITHUB_WORKSPACE/.github/workflows/demo_data"
+
+          dump_logs() {
+            for f in logs/celery.log logs/fastapi.log; do
+              echo "---------- $f ----------"
+              cat "$f" 2>/dev/null || echo "(missing)"
+            done
+          }
+          fail() { echo "::error::$1"; dump_logs; exit 1; }
+
+          # Direct grade.sh run (no server): all tests must pass
+          direct_grade() {
+            local Q="$1" SUB="$2" FLAG="$3" OUT SCORE
+            echo "--- $Q ${FLAG:-(no sandbox)} ---"
+            OUT=$(./grade.sh --submission "$SUB" --question "$Q" --testcases_dir testcases --config config.json $FLAG 2>&1) || true
+            echo "$OUT"
+            SCORE=$(echo "$OUT" | sed -n 's/^\[SCORE\] //p' | tail -1)
+            [ -n "$SCORE" ] || fail "$Q: grade.sh produced no [SCORE] line"
+            [ "${SCORE%/*}" = "${SCORE#*/}" ] && [ "${SCORE#*/}" != "0" ] \
+              || fail "$Q: direct grade.sh run scored $SCORE (expected all tests to pass)"
+          }
+
+          # Submit through the API, wait for Celery, require full marks
+          submit_and_check() {
+            local Q="$1" FILE="$2"
+            echo "--- $Q ($FILE) ---"
+            local RESP TASK OUT STATUS
+            RESP=$(curl -s -F "roll=$ROLL" -F "file=@$FILE" "$BASE/submit/$Q")
+            echo "submit response: $RESP"
+            TASK=$(echo "$RESP" | jq -r '.taskid // empty')
+            [ -n "$TASK" ] || fail "$Q: no taskid returned"
+
+            for i in $(seq 1 90); do
+              OUT=$(curl -s "$BASE/task-status/$TASK")
+              STATUS=$(echo "$OUT" | jq -r '.status')
+              [ "$STATUS" = "SUCCESS" ] || [ "$STATUS" = "FAILURE" ] && break
+              sleep 2
+            done
+            echo "$Q task result:"
+            echo "$OUT" | jq .
+            [ "$STATUS" = "SUCCESS" ] || fail "$Q: Celery task ended with status '$STATUS'"
+
+            echo "$OUT" | jq -e '.result.status == "Finished"' > /dev/null \
+              || fail "$Q: grader did not finish cleanly (status: $(echo "$OUT" | jq -r '.result.status'))"
+            echo "$OUT" | jq -e '.result.marks == .result.full' > /dev/null \
+              || fail "$Q: reference solution did not get full marks ($(echo "$OUT" | jq -r '.result.marks') / $(echo "$OUT" | jq -r '.result.full'))"
+
+            echo "$Q: full marks OK. marks.txt:"
+            cat "submissions/$Q/$ROLL/marks.txt"
+          }
+          HELPERS
+          echo "helpers written to $RUNNER_TEMP/helpers.sh"
+
+      - name: "Smoke 2/12 - Check grader prerequisites"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+
+          echo "=== Package contents ==="
+          ls -la
+          echo
+
+          [ -x ./grade.sh ] || fail "grade.sh is missing or not executable in the server package (task.py runs ./grade.sh)"
+          for tool in gcc make jq firejail redis-cli; do
+            command -v "$tool" > /dev/null || fail "$tool not installed"
+          done
+          [ -x /usr/bin/time ] || echo "::warning::/usr/bin/time missing; verdicts will show empty timings (harmless)"
+
+          T=$(mktemp -d)
+          (cd "$T" && ulimit -v $((512 * 1024)) && firejail --quiet --noprofile --private=. echo "firejail OK") \
+            || echo "::warning::firejail cannot run on this runner; --sandbox grading will likely fail"
+          rm -rf "$T"
+
+          echo "=== Reference Makefiles (target must match config executable_name) ==="
+          for Q in Q4 Q5; do
+            echo "--- $Q/Makefile ---"
+            cat "$DEMO/Reference_solutions/$Q/Makefile"
+          done
+          jq '{Q4: .Q4, Q5: .Q5}' config.json
+
+      - name: "Smoke 3/12 - Run grade.sh directly (no server)"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          # Q1 both ways: if plain passes but sandboxed fails, the problem is firejail, not the grader
+          direct_grade Q1 "$DEMO/Reference_solutions/Q1.c" ""
+          direct_grade Q1 "$DEMO/Reference_solutions/Q1.c" "--sandbox"
+          direct_grade Q2 "$DEMO/Reference_solutions/Q2.c" "--sandbox"
+          direct_grade Q3 "$DEMO/Reference_solutions/Q3.c" "--sandbox"
+          direct_grade Q4 "$DEMO/Reference_solutions/Q4"   "--sandbox"
+          direct_grade Q5 "$DEMO/Reference_solutions/Q5"   "--sandbox"
+          rm -rf /tmp/sandbox_* /tmp/ig_build_* 2>/dev/null || true
+          echo "Direct grader checks passed"
+
+      - name: "Smoke 4/12 - Start server (start.sh)"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          source ~/.venv/bin/activate
+          bash start.sh || fail "start.sh failed (pre-flight or startup)"
+  
+      - name: "Smoke 5/12 - Wait for Redis, FastAPI and Celery"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+
+          echo "=== Redis ==="
+          for i in $(seq 1 15); do
+            redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          redis-cli ping | grep -q PONG || fail "Redis is not responding"
+
+          echo "=== FastAPI (up to 40s) ==="
+          for i in $(seq 1 40); do
+            curl -sf "$BASE/openapi.json" -o /dev/null && break
+            sleep 1
+          done
+          curl -sf "$BASE/openapi.json" -o /dev/null || fail "FastAPI never came up on :8000"
+          echo "FastAPI is up"
+
+          echo "=== Celery worker (up to 40s) ==="
+          for i in $(seq 1 40); do
+            grep -qi " ready" logs/celery.log 2>/dev/null && break
+            sleep 1
+          done
+          grep -qi " ready" logs/celery.log || fail "Celery worker never reported ready"
+          echo "Celery is ready"
+
+      - name: "Smoke 6/12 - Register a student and fetch starter kit"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+
+          echo "=== Unregistered roll should be rejected ==="
+          curl -s "$BASE/starter/NOTAROLL999"; echo
+
+          ROLL=$(grep -v '^\s*$' students.txt | head -1 | tr -d '\r' | tr '[:lower:]' '[:upper:]')
+          echo "Using roll: $ROLL"
+          echo "ROLL=$ROLL" >> "$GITHUB_ENV"     # available in later steps
+
+          curl -sf -o /tmp/kit.zip "$BASE/starter/$ROLL" || fail "starter kit download failed"
+          unzip -l /tmp/kit.zip | head -30
+          cat registrations.csv
+
+      - name: "Smoke 7/12 - Submit Q1-Q3 (single-file questions)"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          for Q in Q1 Q2 Q3; do
+            submit_and_check "$Q" "$DEMO/Reference_solutions/$Q.c"
+          done
+
+
+      - name: "Smoke 8/12 - Submit Q4-Q5 (Makefile questions, .tar.gz)"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          for Q in Q4 Q5; do
+            tar -czf "/tmp/$Q.tar.gz" -C "$DEMO/Reference_solutions" "$Q"
+            tar -tzf "/tmp/$Q.tar.gz" | head -10
+            submit_and_check "$Q" "/tmp/$Q.tar.gz"
+          done
+
+      - name: "Smoke 9/12 - Leaderboard and submission status"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          curl -s "$BASE/api/leaderboard" | jq .
+          curl -s "$BASE/submission-status" | jq .
+
+
+      - name: "Smoke 10/12 - Stop server (stop.sh)"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          # stop.sh waits for the Celery queue to drain; timeout guards against a hang
+          timeout 180 bash stop.sh || fail "stop.sh failed or timed out (queue did not drain?)"
+          sleep 1
+          if pgrep -f "fastapi run main.py" > /dev/null || pgrep -f "celery -A task.capp worker" > /dev/null; then
+            fail "FastAPI or Celery still running after stop.sh"
+          fi
+          if curl -s -o /dev/null --max-time 3 "$BASE/openapi.json"; then
+            fail "Server still answering on :8000 after stop.sh"
+          fi
+          echo "All server processes stopped"
+
+
+      - name: "Smoke 11/12 - Inspect submissions folder"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+
+          echo "=== Submissions folder structure ==="
+          tree -a submissions
+          [ -d late_submissions ] && fail "Unexpected late_submissions/ folder (lab window should be open)"
+
+          GOT=$(ls submissions | sort | tr '\n' ' ')
+          echo "Found: $GOT"
+          [ "$GOT" = "Q1 Q2 Q3 Q4 Q5 " ] || fail "submissions/ should contain exactly Q1..Q5, found: $GOT"
+
+          for Q in Q1 Q2 Q3 Q4 Q5; do
+            D="submissions/$Q/$ROLL"
+            echo
+            echo "######## $D ########"
+            ls -la "$D"
+            [ -s "$D/marks.txt" ] || fail "$D/marks.txt missing or empty"
+            ls "$D"/result_*.txt > /dev/null 2>&1 || fail "$D has no result_*.txt log"
+            echo "--- marks.txt ---"
+            cat "$D/marks.txt"
+            echo "--- latest result log (first 40 lines) ---"
+            head -40 "$(ls -t "$D"/result_*.txt | head -1)"
+          done
+
+          echo
+          echo "=== Makefile submissions should have an extracted archive ==="
+          for Q in Q4 Q5; do
+            ls -d "submissions/$Q/$ROLL"/extracted_* || fail "$Q: no extracted_* folder (archive not unpacked)"
+            tree -a "$(ls -d submissions/$Q/$ROLL/extracted_* | head -1)"
+          done
+    
+      - name: "Smoke 12/12 - Scan server logs for tracebacks"
+        working-directory: Labs/packageIG_L1
+        run: |
+          source "$RUNNER_TEMP/helpers.sh"
+          if grep -q "Traceback" logs/fastapi.log logs/celery.log; then
+            fail "Traceback found in server logs"
+          fi
+          echo "Smoke test passed"
+
+
+      - name: Dump Server Logs
+        if: always()
+        working-directory: Labs/packageIG_L1
+        run: |
+          for f in logs/celery.log logs/fastapi.log; do
+            echo "=================== $f ==================="
+            cat "$f" 2>/dev/null || echo "(missing)"
+          done
+          echo "=================== violations.csv ==================="
+          cat violations.csv 2>/dev/null || echo "(none)"
+
+      - name: Ensure Server Stopped
+        if: always()
+        working-directory: Labs/packageIG_L1
+        run: timeout 180 bash stop.sh || true

@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c99
-TARGET = Q1
+TARGET = Q4
 
 all: $(TARGET)
 
